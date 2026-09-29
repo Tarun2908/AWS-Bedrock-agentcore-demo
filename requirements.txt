@@ -1,0 +1,9 @@
+# Core AgentCore + Strands agent stack
+bedrock-agentcore
+strands-agents
+strands-agents-tools
+
+# CloudWatch Omni observability: AWS Distro for OpenTelemetry.
+# This single dependency is what makes the runtime export gen_ai.* spans.
+# Strands has built-in OTel tracing, so no OpenInference package is required.
+aws-opentelemetry-distro>=0.20.0
