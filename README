@@ -326,8 +326,9 @@ Once traces are flowing, walk through the full feature set. Omni has **two surfa
 
 ## Sources
 
-- Introducing CloudWatch Omni (AWS News Blog, 22 Sep 2026)
+- Introducing CloudWatch Omni (AWS News Blog, 22 Sep 2026) - https://aws.amazon.com/blogs/mt/introducing-amazon-cloudwatch-omni-observability-for-the-ai-era/
 - Monitor AI agents — CloudWatch User Guide
 - Send AI agent telemetry — CloudWatch User Guide (AgentCore section)
 - Get started with AgentCore Runtime / starter toolkit — Bedrock AgentCore Dev Guide
+- CloudWatch Omni Playground - https://cloudwatch-omni.global.app.aws/home/?playground
 
