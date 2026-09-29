@@ -1,0 +1,334 @@
+# AgentCore + CloudWatch Omni — end-to-end monitoring demo
+
+A minimal Strands agent deployed on **Amazon Bedrock AgentCore Runtime**, with **full CloudWatch Omni observability** turned on and every Omni feature exercised.
+
+> **What is CloudWatch Omni?** An AI-powered, app-centric observability experience for applications *and* AI agents, delivered **off-console** (its own SSO URL `https://<domain>.cloudwatch-omni.global.app.aws`) plus an **IDE extension** for VS Code, Kiro, and Cursor. It became GA on **22 Sep 2026**. It reads the same OpenTelemetry telemetry you already send to CloudWatch — an AgentCore agent's traces appear in Omni with nothing extra to reconfigure.
+
+---
+
+## Files in this folder
+
+| File | Purpose |
+| --- | --- |
+| `agent.py` | The agent — Strands + one tool, wrapped in `BedrockAgentCoreApp` |
+| `requirements.txt` | Deps incl. `aws-opentelemetry-distro` (the observability piece) |
+| `deploy.py` | Starter-toolkit deploy: configure → launch → invoke |
+
+---
+
+## How the observability wiring works (the important part)
+
+You do **not** write any CloudWatch code. The chain is:
+
+1. **Strands** emits OpenTelemetry spans natively (model calls, tool calls, reasoning).
+2. `aws-opentelemetry-distro` (ADOT) is the exporter — installed via requirements.txt.
+3. **AgentCore Runtime** sets `AGENT_OBSERVABILITY_ENABLED=true`, which turns on ADOT's managed export defaults (`OTEL_TRACES_EXPORTER=otlp`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, regional X-Ray OTLP endpoint). **Do not set these yourself** — they're managed.
+4. Traces land in CloudWatch → appear automatically in **CloudWatch Omni**.
+
+The only env var you add is `AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT=true`, which keeps prompt/response text inside spans so Trace Explorer and evaluators can read it.
+
+---
+
+## Step 0 — Set up CloudWatch Omni first (one-time)
+
+Before any agent traces can appear in the Omni web UI, you onboard your account to Omni by creating a **domain** and a **space**. This is a one-time setup per account.
+
+- **Domain** — your organization's identity/access boundary and sign-in URL (`https://<domain-name>.cloudwatch-omni.global.app.aws`).
+- **Space** — where you actually work with your telemetry (traces, evaluations, dashboards). A space lives in a specific account + Region and reads the CloudWatch telemetry there.
+
+> Enabling Omni changes nothing in your existing CloudWatch — metrics, logs, alarms, dashboards, and Logs Insights all keep working.
+
+### Choose your path: single account vs. organization
+
+|  | **Single account** (most common) | **AWS Organization** |
+| --- | --- | --- |
+| Who creates the domain | Any individual AWS account | The Organizations **management account** |
+| Where the space is created | Same session as the domain | Each **member account** creates its own space |
+| Sign-in URL | Per account | One shared URL for the whole org |
+| Pick this if… | You operate in one AWS account | You run many accounts and want one entry point |
+
+**Important:** In the **Organization** path, the domain (management) account **cannot create a space on a member's behalf** — each member account must create its own space from *its own* telemetry configuration. If you pick the org path by mistake in a single account, the space step will stay "pending" and you'll see no space. For a single-account setup, choose **Account domain** so the domain and space are created together.
+
+### Set up (single-account path — the normal customer flow)
+
+1. Sign in to the AWS account and Region where your agent will run and send traces (this **must** be the same Region as your agent + Transaction Search).
+2. Open the Omni setup page: `https://console.aws.amazon.com/cloudwatch/home?region=<region>#settings:/omni`
+3. Choose **Get started** → select **Account domain**.
+4. **Enter a domain name.** Rules: 3–63 chars, lowercase letters/numbers/hyphens; start and end with a letter/number; no consecutive hyphens; cannot start with `aws-`, `amazon-`, `cloudwatch-`, or `omni-`; must be globally unique.
+5. **Complete the permissions step** — Omni creates the IAM roles it needs on your behalf (just approve).
+6. When the domain finishes, **space setup continues automatically** in the same flow. Enter a **space name** and **confirm the account and Region** (accept the account you're signed into; verify the Region matches your agent).
+7. Finish. You now have an active space ready to receive telemetry.
+
+### Sign-in / identity provider (how your team reaches the web UI)
+
+The Omni web UI is **off-console** — you reach it at your domain URL and sign in through **AWS IAM Identity Center (IdC)**, using the identities you already manage (including an external IdP like Okta or Microsoft Entra ID connected to IdC). Configure this **at the domain, not per space**. Requirements:
+
+- The IAM Identity Center instance must be in the **same Region as your domain**.
+- Add your team as users and **grant them access to the space** (see *Control access to your space*).
+
+### Two ways to view agent telemetry
+
+| Surface | Where | Needs a domain/space? | Best for |
+| --- | --- | --- | --- |
+| **CloudWatch Omni** (off-console) | `https://<domain>.cloudwatch-omni.global.app.aws` | Yes (this Step 0) | Eval-driven workflow, datasets, experiments, fleet views, IDE extension |
+| **Generative AI observability** (in-console) | `console.aws.amazon.com/cloudwatch/home#gen-ai-observability/agent-core` | **No** | Quick prebuilt views of AgentCore agents; both read the same telemetry |
+
+> Tip: both experiences read the same ingested telemetry, so an AgentCore agent's traces appear in each. If you just want to *see* traces immediately without finishing domain/space + IdC, use the in-console **Generative AI observability** view.
+
+### After setup
+
+- Send telemetry from your agent (the rest of this guide) — no reconfiguration needed once the space exists in the agent's account + Region.
+- Add your team and set per-person permissions on the space.
+- (Optional) Centralize telemetry from more than one account into the space.
+
+---
+
+## Prerequisites (the checks — do these first)
+
+> Do **Step 0** (set up the Omni domain + space) before these if you want traces in the Omni web UI. The checks below are for deploying + instrumenting the agent.
+
+- [ ] **AWS credentials** configured for a region where Bedrock + AgentCore are available (e.g. `us-east-1`, `us-west-2`).
+- [ ] **Bedrock model access** enabled for your model (Console → Bedrock → Model access → Amazon Nova Lite).
+- [ ] **Docker running** — *only if you use the local build (Option A)*. Not needed with the CodeBuild route (Option B). See **Choose a build mode** below.
+- [ ] **Transaction Search enabled** in the account/Region that receives traces — *this is mandatory; traces sent before it's on are not searchable.* If not enabled:
+  ```bash
+  aws xray update-trace-segment-destination --destination CloudWatchLogs --region <region>
+  # takes ~10 minutes to take effect
+  
+  ```
+- [ ] **Execution-role permission** for AgentCore's custom log group — attach this statement to the runtime execution role (the toolkit's auto-created role usually needs this added):
+  ```json
+  { "Effect": "Allow", "Action": ["logs:PutResourcePolicy"], "Resource": "*" }
+  
+  ```
+- [ ] Install the toolkit: `uv pip install bedrock-agentcore-starter-toolkit` (or `pip install`).
+
+---
+
+## Choose a build mode
+
+The AgentCore starter toolkit has to build a **container image** for your agent before it can run it in the cloud. There are two ways to build that image — pick one.
+
+|  | **Local Docker build** (default) | **Cloud build with CodeBuild** (`--codebuild`) |
+| --- | --- | --- |
+| Where the image is built | On your laptop | In AWS CodeBuild |
+| Docker required locally? | **Yes** — daemon must be running | **No** |
+| CPU architecture | You must produce **ARM64** (AgentCore requires it) | CodeBuild builds ARM64 for you |
+| Best for | Fast local iteration on a dev machine with Docker | Locked-down/corporate laptops, no Docker, or building ARM64 from an x86 machine |
+| First-run cost | Immediate | Slightly slower — provisions a CodeBuild project + service role once |
+
+**Why CodeBuild is often the better choice:** AgentCore Runtime only runs **ARM64** images. If your laptop is x86 (most Windows/Intel machines), a local Docker build has to cross-build for ARM64, which is slow and error-prone. CodeBuild sidesteps this entirely — it builds the correct architecture in the cloud — and removes the need for Docker Desktop altogether, which matters on managed corporate machines where you can't install or run it. **In both modes the agent itself runs in the cloud on AgentCore Runtime; Docker (if used) only builds the image, it never runs the agent.**
+
+---
+
+### Option A — Local Docker build (default)
+
+> Requires Docker Desktop installed and **running** on your laptop.
+
+Python path (what `deploy.py` uses):
+
+```bash
+cd agentcore-omni-demo
+pip install -r requirements.txt          # local deps
+python deploy.py                         # configure -> launch -> invoke
+
+```
+
+`deploy.py` prints the **Agent ARN** and fires two invocations so you immediately have traces to look at.
+
+---
+
+### Option B — Cloud build with CodeBuild (no local Docker)
+
+> Nothing to install but the AWS CLI + starter toolkit. The image builds in AWS CodeBuild.
+
+**What you need for this route**
+
+- [ ] **AWS CLI v2** configured for `us-east-1` (`aws configure`)
+- [ ] **Starter toolkit**: `pip install bedrock-agentcore-starter-toolkit`
+- [ ] Project files present: `agent.py`, `requirements.txt`
+- [ ] **Your caller identity** (the CLI credentials you run with) can create the cloud build resources — at minimum:
+  - `codebuild:CreateProject`, `codebuild:StartBuild`, `codebuild:BatchGetBuilds`
+  - `ecr:CreateRepository`, `ecr:GetAuthorizationToken`, and ECR push actions
+  - `iam:CreateRole` + `iam:PassRole` (to create & hand over the CodeBuild service role and the agent execution role)
+  - `bedrock-agentcore:*` (create/deploy the runtime)
+  - `s3:*` on the toolkit's staging bucket (CodeBuild pulls your uploaded source from S3)
+  - `logs:*` (CodeBuild build logs)
+- [ ] **CodeBuild service role** — *auto-created* by the toolkit on first `--codebuild` launch, so no manual step as long as your caller identity has the `iam:CreateRole`/`iam:PassRole` above.
+- [ ] **AgentCore Runtime execution role** — auto-created (`--auto-create-execution-role` / toolkit default), or pass your own with `-er <ROLE_ARN>`.
+
+> **Command update (important).** The Python starter-toolkit CLI is deprecated, and its flags changed:
+> - `--codebuild` → renamed to `--code-build`, and it is now **deprecated** because **CodeBuild is the default** — so you don't pass any build flag at all.
+> - `launch` → use `deploy`.
+> - `configure`** is mandatory and must run first** — it writes `.bedrock_agentcore.yaml`. If you run `deploy` without it you get `FileNotFoundError: Configuration not found: .bedrock_agentcore.yaml`.
+
+**CLI commands (corrected)**
+
+```bash
+# 1. Configure FIRST — creates .bedrock_agentcore.yaml + Dockerfile, auto-creates the execution role.
+#    Run this from inside the project folder (where agent.py and requirements.txt live).
+agentcore configure --entrypoint agent.py -n omni_demo_agent -r us-east-1
+
+# 2. Deploy — CodeBuild is the DEFAULT now, so no build flag is needed (no local Docker).
+agentcore deploy --env AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT=true
+
+# 3. Invoke to generate your first trace
+agentcore invoke '{"prompt": "What is the weather in Mumbai?"}'
+
+```
+
+> To silence the "starter toolkit no longer supported" nag: `set AGENTCORE_SUPPRESS_RECOMMENDATION=1` (PowerShell: `$env:AGENTCORE_SUPPRESS_RECOMMENDATION=1`).
+
+> **Invoking on Windows PowerShell (quoting gotcha).** Bash-style single quotes and `\"` escapes do **not** work in PowerShell — it strips the quotes and splits the JSON on spaces (`Got unexpected extra argument(s)`). Pass the payload as a variable so the CLI receives one clean token:
+> ```powershell
+> $payload = '{"prompt": "What is the weather in Mumbai?"}'
+> agentcore invoke $payload
+> 
+> ```
+> If it still splits, use the stop-parsing token: `agentcore invoke --% {"prompt": "What is the weather in Mumbai?"}`. On macOS/Linux (bash/zsh), the original `agentcore invoke '{"prompt": "..."}'` works as-is.
+
+**Python equivalent** (if you'd rather script it in `deploy.py`): add `use_codebuild=True` to the launch call — everything else stays the same.
+
+```python
+launch_result = runtime.launch(
+    env_vars={"AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT": "true"},
+    use_codebuild=True,   # build in the cloud, no local Docker
+)
+
+```
+
+### What happens during `agentcore configure` (the `.bedrock_agentcore.yaml` prompts)
+
+`configure` is interactive — it writes `.bedrock_agentcore.yaml`, which every later `deploy` reads. Here's what it asks and how to answer for this demo.
+
+**1. Entrypoint & agent name**
+
+- `--entrypoint agent.py` — the file with your `@app.entrypoint`.
+- `-n omni_demo_agent` — the agent name (lowercase + underscores).
+- `-r us-east-1` — keep it the **same region** as your Transaction Search setup, or Omni won't see the traces.
+
+**2. Execution role (the identity the agent RUNS as)**
+
+- Prompt: *"Execution role ARN (leave blank to auto-create)"*. Press **Enter** to let the toolkit create one, **or** paste your own with `-er <ROLE_ARN>`.
+- This role needs Bedrock model-invoke permissions **and** the observability statement `logs:PutResourcePolicy` on `*` (so AgentCore can write to its custom log group). Add it if you bring your own role.
+
+**3. ECR repository (where the built image is stored)**
+
+- Prompt: *"ECR repository (leave blank to auto-create)"*. Press **Enter** to auto-create. CodeBuild pushes the image here before the runtime pulls it.
+
+**4. Authorization — how callers are allowed to invoke the agent** This is the inbound authorizer. Choose one:
+
+- **IAM (SigV4)** — the **default** and simplest. Callers sign requests with AWS credentials/IAM. Best for this demo and for backend-to-backend calls. If you just press Enter through the auth prompts, you get this.
+- **Custom JWT (OAuth/OIDC)** — for end-user auth via an IdP (Cognito, Okta, etc.). You supply a **discovery URL** (`.../.well-known/openid-configuration`) and **allowed clients/audiences**; AgentCore validates the token's signature, expiry, issuer, and (optionally) custom claims before the agent code runs. Configure with:```bash
+
+# non-interactive equivalent
+
+--authorizer-config '{"customJWTAuthorizer": {"discoveryUrl": "https:///.well-known/openid-configuration", "allowedClients": [""]}}'
+
+```Use
+
+**5. Memory — does the agent remember across turns/sessions?** Memory is **optional** and **off by default** (the runtime already keeps ephemeral, session-scoped state during a live conversation). You only add AgentCore Memory if you want persistence:
+
+- **Short-term memory (STM)** — raw recent turns, retrievable even if the runtime restarts. Enough for multi-turn chat within a session:```bash
+agentcore add memory --name omni_demo_memory
+agentcore deploy
+
+```
+
+- **Long-term memory (LTM)** — adds extraction *strategies* that consolidate insights across different sessions. Pick strategies at creation:| Strategy | What it stores | Example | | --- | --- | --- | | `SUMMARIZATION` | Condensed session history | running conversation summaries | | `USER_PREFERENCE` | Explicit user choices/settings | "prefers metric units" | | Semantic | Factual info about the user | "user works in finance" | | Episodic | Past interactions / lessons | "had trouble with X last week" |```bash agentcore add memory --name omni_demo_memory --strategies SUMMARIZATION,USER_PREFERENCE agentcore deploy
+
+```- Memory commands run **inside an existing agentcore project** (after `configure`). Wait for the memory status to reach **ACTIVE** (`agentcore status`) before invoking. LTM records are only extracted from events stored *after* the strategy becomes active.
+
+- **For this Omni monitoring demo, skip memory** — it adds moving parts without changing what the tracing/evaluation walkthrough shows. Add it later only if you want to see Session Explorer follow context across separate sessions.
+
+**6. Observability — leave it ON** The toolkit enables AgentCore Observability by default (that's what feeds CloudWatch Omni). Do **not** pass `disable_otel=True`. The only telemetry env var you add is `AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT=true` at deploy time.
+
+---
+
+**Notes for the CodeBuild route**
+
+- `--env` values are **not persisted** — pass `AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT=true` on *every* launch. Never pass `AGENT_OBSERVABILITY_ENABLED` — the runtime sets it.
+- First `deploy` is slower because it provisions the CodeBuild project + service role once; later deploys reuse them.
+- The toolkit is **deprecated** in favor of the new AgentCore CLI (`npm install -g @aws/agentcore`). The `deploy` commands above still work for this demo; migrate when you build beyond it.
+- Region must be consistent: the `-r` region, your Transaction Search setup, and where you view traces in Omni should all be the same (`us-east-1` here).
+
+---
+
+## Complete the end-to-end monitoring — every Omni feature
+
+Once traces are flowing, walk through the full feature set. Omni has **two surfaces** that share the same data: the **IDE extension** (dev-time) and the **web UI** (production/fleet). Some features are surface-specific — noted below.
+
+### A. Connect a surface
+
+- **Web UI:** sign in at your org's Omni domain URL (`…cloudwatch-omni.global.app.aws`). No AWS console needed.
+- **IDE extension:** install *CloudWatch Omni* from the VS Code / Kiro / Cursor marketplace; use **Cloud Login** to connect the extension to your AWS account so it reads the same production traces.
+
+### B. Tracing — `Trace Explorer`
+
+- [ ] Open a trace from one of your invocations. You'll see a **hierarchical timeline**: the agent span → the LLM call span → the `get_weather` tool span.
+- [ ] Drill into a span to inspect **inputs, outputs, token usage, and latency**.
+- [ ] Use **Compare mode** — put two traces side by side (e.g. the weather run vs. the summary run) to see how behavior/prompt differences play out.
+- [ ] Try **Ask Assistant** — ask "why did the agent call this tool?" and let the AI analyze the trace.
+
+### C. Sessions — `Session Explorer`
+
+- [ ] Send a **multi-turn** conversation (invoke a few related prompts) and review the full session to see how the agent handles context across turns.
+
+### D. Agent topology
+
+- [ ] Open the **Agent Topology** view — it visualizes the agent, its tool(s), and sub-agents as a graph. Drill into any node to spot bottlenecks.
+
+### E. Evaluation — `Evaluators and evaluations`
+
+- [ ] Select traces in Trace Explorer, pick from the **17 built-in evaluators** (coherence, helpfulness, faithfulness, routing/tool-selection correctness, retrieval quality, etc.) and run an evaluation. You get per-example scores + aggregates — no custom framework.
+- [ ] (Optional) Add a **third-party evaluator** (DeepEval / AutoEval) or a **custom LLM-judge** evaluator.
+- [ ] **Online evaluations** (web UI only): turn on continuous scoring of production traffic.
+
+### F. Datasets
+
+- [ ] Curate good/bad traces into a **golden dataset** ("build dataset from production traffic") for repeatable regression testing.
+
+### G. Playground + Prompt Management (IDE)
+
+- [ ] In the **Playground**, test two system prompts / two models side by side and compare output quality before committing.
+- [ ] Use **Prompt Management** to version prompts so you can roll back a regression.
+
+### H. Experiments (IDE)
+
+- [ ] Run an **experiment**: the same dataset against two agent variants; compare evaluation scores, latency, and token usage to pick the winner.
+
+### I. Application + fleet monitoring (web UI)
+
+- [ ] In the web UI, view **RED metrics** (rate, errors, duration), aggregate agent health, native **alerting** (Slack / SNS), and **AI-powered investigations** (DevOps Agent root-cause on alert).
+
+---
+
+## Feature availability by surface (quick reference)
+
+| Capability | Web UI | IDE extension |
+| --- | --- | --- |
+| Agent traces / sessions / topology | ✅ | ✅ |
+| Datasets, evaluators & evaluations | ✅ | ✅ |
+| Prompt playground | ✅ | ✅ |
+| Online (continuous) evaluations | ✅ | ❌ |
+| Aggregate / fleet views | ✅ | ❌ |
+| Experiments | ❌ | ✅ |
+| Prompt management & versioning | ❌ | ✅ |
+| Test agent locally / agent-assisted setup | ❌ | ✅ |
+
+---
+
+## Notes & gotchas
+
+- **Two observability experiences coexist:** classic *generative AI observability* (in the AWS console, prebuilt views) and *CloudWatch Omni* (off-console, eval + IDE + fleet). Both read the same telemetry, so your AgentCore traces show up in both.
+- **Don't** set `AGENT_OBSERVABILITY_ENABLED` or the `OTEL_*` export vars manually on AgentCore — the runtime + ADOT manage them.
+- **Don't** create a second OpenTelemetry tracer provider in code — ADOT registers the global one; a second provider is orphaned and never exports.
+- Toolkit builds a container image → **Docker must be running** and the role needs **ECR pull** permission.
+
+## Sources
+
+- Introducing CloudWatch Omni (AWS News Blog, 22 Sep 2026)
+- Monitor AI agents — CloudWatch User Guide
+- Send AI agent telemetry — CloudWatch User Guide (AgentCore section)
+- Get started with AgentCore Runtime / starter toolkit — Bedrock AgentCore Dev Guide
+
