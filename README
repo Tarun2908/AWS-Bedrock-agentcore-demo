@@ -8,11 +8,10 @@ A minimal Strands agent deployed on **Amazon Bedrock AgentCore Runtime**, with *
 
 ## Files in this folder
 
-| File | Purpose |
-| --- | --- |
-| `agent.py` | The agent — Strands + one tool, wrapped in `BedrockAgentCoreApp` |
-| `requirements.txt` | Deps incl. `aws-opentelemetry-distro` (the observability piece) |
-| `deploy.py` | Starter-toolkit deploy: configure → launch → invoke |
+File Purpose 
+ `agent.py` - The agent — Strands + one tool, wrapped in `BedrockAgentCoreApp` 
+ `requirements.txt` - Deps incl. `aws-opentelemetry-distro` (the observability piece) 
+ `deploy.py` - Starter-toolkit deploy: configure → launch → invoke 
 
 ---
 
