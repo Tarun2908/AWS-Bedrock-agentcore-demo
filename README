@@ -39,12 +39,7 @@ Before any agent traces can appear in the Omni web UI, you onboard your account 
 
 ### Choose your path: single account vs. organization
 
-|  | **Single account** (most common) | **AWS Organization** |
-| --- | --- | --- |
-| Who creates the domain | Any individual AWS account | The Organizations **management account** |
-| Where the space is created | Same session as the domain | Each **member account** creates its own space |
-| Sign-in URL | Per account | One shared URL for the whole org |
-| Pick this if… | You operate in one AWS account | You run many accounts and want one entry point |
+
 
 **Important:** In the **Organization** path, the domain (management) account **cannot create a space on a member's behalf** — each member account must create its own space from *its own* telemetry configuration. If you pick the org path by mistake in a single account, the space step will stay "pending" and you'll see no space. For a single-account setup, choose **Account domain** so the domain and space are created together.
 
